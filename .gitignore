@@ -1,0 +1,17 @@
+# Editor backup files
+*~
+
+# Node.js libraries and modules
+node_modules
+
+# Eclipse project info
+.project
+.buildpath
+.settings
+
+# Configuration
+settings/bot.inc
+settings/werewolf
+
+# php errors
+/error_log
