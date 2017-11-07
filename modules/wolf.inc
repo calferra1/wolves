@@ -1,0 +1,2530 @@
+<?php
+define('NO_OPERATOR', true);
+
+class wolf extends irc {
+
+	// Settings store
+	private $setting;
+
+	// Libraries for phpwolf
+	private $random, $locale;
+	protected $TokenBucket;
+
+	// Options passed
+	private $bot;
+	private $irc;
+	private $channel;
+	private $admins;
+	private $lang;
+
+	// List of players
+	private $players;
+	private $lynch, $away;
+
+	// In-game stores
+	private $people; // Full list of people in the channel
+	private $ongoing; // Is the game still going?
+
+	// Counters and timeouts
+	private $game_wait, $wait_extended, $last_stats, $last_ping;
+
+	// Day and night
+	private $isDay, $isNight;
+	private $day_time, $night_time;
+	private $current_day_start, $current_night_start;
+
+	// Goat
+	private $goat_switch;
+
+	// Role variables
+	private $seer, $wolf, $cursed, $drunk, $harlot, $traitor,
+		$gunner, $crow, $angel, $detective, $ghost;
+
+	// Seen, visited, killed variables (per night/day)
+	private $seer_seen, $wolf_killed, $harlot_visited, $gunner_shot,
+		$gunner_bullets, $crow_observed, $angel_guarded, $detective_ided,
+		$ghost_died;
+
+	private $roles_set; // roles available corresponding to amount of players
+	private $roles_message; // Pre-generated and store end roles message
+
+	// Convenience arrays for looping
+	public $role_names = array("wolf", "seer", "cursed", "drunk", "harlot",
+		"traitor", "gunner", "crow", "angel", "detective", "ghost");
+	public $role_vars = array("seer_seen", "wolf_killed", "harlot_visited", 
+		"gunner_shot", "crow_observed", "angel_guarded", "detective_ided",
+		"gunner_bullets", "ghost_died");
+
+	/**
+	 * Constructor for werewolf, initialize variables with default values
+	 */
+	public function __construct($options) {
+		if ( empty($options) || !is_array($options) ) {
+			throw new Exception('Invalid arguments');
+		}
+
+		$this->bot = $options['bot'];
+		$this->irc = $options['irc'];
+		$this->channel = $options['channel'];
+		$this->admins = $options['admins'];
+		$this->lang = $options['lang'];
+		$this->settings_path = $options['settings_path'];
+		$this->locale_path = $options['locale_path'];
+		unset($options);
+
+		// The language handler.
+		$this->locale = new locale(LOCALES_PATH, '.inc');
+		$this->locale->setLanguage($this->lang);
+
+		// TokenBucket - Inherited IRC Class doesn't run through constructor since we overrided it here
+		$this->TokenBucket = new TokenBucket(23, 1.73);
+
+		$this->random = new random();
+
+		$this->players = array();
+		$this->lynch = array(); $this->away = array();
+
+		$this->people = array(); $this->ongoing = false;
+
+		$this->wait_extended = 0; $this->last_stats = 0; $this->last_ping = 0;
+
+		$this->isDay = null; $this->isNight = null;
+		$this->day_time = 0; $this->night_time = 0;
+		$this->gaveDayWarning = false; $this->gaveNightWarning = false;
+
+		$this->goat_switch = true;
+
+		$this->roles_message = '';
+
+		$this->ghost = array();
+		$this->seer = array();
+		$this->wolf = array();
+		$this->cursed = array();
+		$this->drunk = array();
+		$this->harlot = array();
+		$this->traitor = array();
+		$this->gunner = array();
+		$this->crow = array(); 
+		$this->angel = array();
+		$this->detective = array();
+
+		$this->seer_seen = array();
+		$this->wolf_killed = array();
+		$this->harlot_visited = array();
+		$this->gunner_shot = array();
+		$this->gunner_bullets = array();
+		$this->crow_observed = array();
+		$this->angel_guarded = array();
+		$this->detective_ided = array();
+		$this->ghost_died = array();
+
+		// Import werewolf settings
+		include($this->settings_path . '/werewolf.inc');
+		$this->setting = $wolf;
+
+		$this->away_file = $this->settings_path . '/werewolf/' . 'away_list';
+
+		if (file_exists($this->away_file)) {
+			$this->away = explode(',', file_get_contents($this->away_file) );
+		}
+	}
+
+	/**
+	 * Alias call for locale->getSubbedString()
+	 * 
+	 * @param mixed $string Locale string
+	 * @return string String with bolded words and correct answer values
+	 */
+	public function string($string, $sub1=null, $sub2=null, $sub3=null, $sub4=null) {
+		return $this->locale->getSubbedString($string, $sub1, $sub2, $sub3, $sub4);
+	}
+
+	/**
+	* Check if the string is a valid corresponding command
+	*
+	* @param mixed $string String to check
+	* @param mixed $command The command the string should be
+	* @param boolean $no_operator Set to true to remove operator requirement
+	* @return boolean True or False answer
+	*/
+	public function isCommand ($string, $command, $no_operator=false) {
+		if ( strtolower($string) == '!' . $command || ($no_operator && strtolower($string) == $command) ) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Return a string with formated seconds
+	 * 
+	 * @param int Seconds
+	 * @param string Formatted seconds ex: 05:32
+	 */
+	public function formatSeconds($seconds) {
+		$minutes = 0;
+		while($seconds >= 60) {
+			$seconds = $seconds - 60;
+			$minutes++;
+		}
+
+		if (strlen($minutes) == 1) {
+			$minutes = '0' . $minutes;
+		}
+		if (strlen($seconds) == 1) {
+			$seconds = '0' . $seconds;
+		}
+		return $minutes . ':' . $seconds;
+	}
+
+	/**
+	* Check if the user has permission to run a command
+	*
+	* @param mixed $nick Nickname of player
+	* @param mixed $host Hostname of player
+	* @param mixed $command Command
+	* @return boolean True or False answer
+	*/
+	public function isAdmin($host) {
+
+		foreach($this->admins as $admin) {
+			$admin = str_replace('.', '\\.', $admin);
+			$admin = str_replace('/', '\/', $admin);
+			$admin = str_replace('*', '.*', $admin);
+
+			if (preg_match("/" . $admin . "$/i", $host) == 1) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Nickname auto-complete
+	 * 
+	 * @param mixed $nick First part of desired nickname
+	 * @return string Full nickname of player
+	 */
+	public function nickAutocomplete($nick) {
+		foreach(array_keys($this->players) as $player) {
+			// if $nick is at beginning (case-insensitive
+			if ( stripos($player, $nick) === 0 ) {
+				if (isset($return)) {
+					// There are more than 1 person with that name, return original nick
+					$return = $nick;
+				} else {
+					$return = $player;
+				}
+			}
+		}
+		if (!isset($return)) {
+			return $nick;
+		}
+		return $return;
+	}
+
+	/**
+	 * Check if the player is playing
+	 * 
+	 * @param mixed $nick Nickname of potential player
+	 * @return boolean True or False answer
+	 */
+	public function isPlaying($nick) {
+		if (!empty($this->players[$nick])) {
+			return true;
+		}
+		return false;
+	}
+
+	public function isBadGuy($nick) {
+		if (in_array($nick, $this->wolf) || in_array($nick, $this->traitor) ||
+				in_array($nick, $this->crow)) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Get all the roles a player has
+	 * 
+	 * @param mixed $nick Nickname of player
+	 * @return array Array containing roles of specified player
+	 */
+	public function getRoles($nick) {
+		foreach($this->role_names as $role) {
+			if (in_array($nick, $this->$role)) {
+				if (!isset($return)) {
+					$return = array($role);
+				} else {
+					array_push($return, $role);
+				}
+			}
+		}
+		if (isset($return)) {
+			return $return;
+		} else {
+			return false;
+		}
+	}
+ 
+	public function getRolesNice($options) {
+		if ( empty($options) || !is_array($options) ) {
+			throw new Exception('Invalid arguments');
+		}
+
+		if (empty($options["nick"])) {
+			throw new Exeption('No nick specified');
+		} else {
+			$nick = $options["nick"];
+		}
+
+		$bold_roles = (empty($options["bold_roles"])) ? true : $options["bold_roles"];
+		$show_cursed = (empty($options["show_cursed"])) ? false : $options["show_cursed"];
+		$cursed_wolf = (empty($options["cursed_wolf"])) ? false : $options["cursed_wolf"];
+		$show_gunner = (empty($options["show_gunner"])) ? false : $options["show_gunner"];
+		$show_traitor = (empty($options["show_traitor"])) ? false : $options["show_traitor"];
+		$show_ghost = (empty($options["show_ghost"])) ? false : $options["show_ghost"];
+
+		$roles = $this->getRoles($nick);
+
+		if ($roles == false) {
+			if ($bold_roles)
+				return chr(2) . $this->string('villager') . chr(2);
+			else
+				return $this->string('villager');
+		}
+
+		// Remove villager if in list, unneeded.
+		$search = array_search('villager', $roles);
+		if ($search !== false) {
+			unset($roles[$search]);
+		}
+
+		// Replace cursed with wolf
+		if ($cursed_wolf) {
+			$search = array_search('cursed', $roles);
+			if ($search !== false) {
+				$roles[$search] = 'wolf';
+			}
+		}
+
+		// Remove cursed from roles unless specified
+		if (!$show_cursed) {
+			$search = array_search('cursed', $roles);
+			if ($search !== false) {
+				unset($roles[$search]);
+			}
+		}
+
+		// Remove gunner from roles unless specified
+		if (!$show_gunner) {
+			$search = array_search('gunner', $roles);
+			if ($search !== false) {
+				unset($roles[$search]);
+			}
+		}
+
+		// Remove gunner from roles unless specified
+		if (!$show_traitor) {
+			$search = array_search('traitor', $roles);
+			if ($search !== false) {
+				unset($roles[$search]);
+			}
+		}
+
+		// Remove ghost from roles unless specified
+		if(!$show_ghost) {
+			$search = array_search('ghost', $roles);
+			if ($search !== false) {
+				unset($roles[$search]);
+			}
+		}
+
+		// Remove duplicated values potentially created from above
+		$roles = array_unique($roles);
+
+		if (count($roles) == 0) {
+			if ($bold_roles)
+				return chr(2) . $this->string('villager') . chr(2);
+			else
+				return $this->string('villager');
+		}
+
+		$amount = count($roles);
+		$list = '';
+		$i = 1;
+		foreach($roles as $role) {
+
+			if ($amount >= 1 && $i != 1) {
+				if ($amount > 2)
+					$list .= ', ';
+				else if ($amount == 2)
+					$list .= ' ';
+				if ($i == $amount)
+					$list .= 'and ';
+			}
+
+			$i++;
+
+			if ($bold_roles)
+				$list .= chr(2) . $this->string($role) . chr(2);
+			else
+				$list .= $this->string($role);
+		}
+
+		return $list;
+	}
+
+	/**
+	 * Get the name of a role by id
+	 * 
+	 * @param int $id ID of role
+	 * @return string Name of role
+	 */
+	public function getRoleByID($id) {
+		switch($id) {
+			case 0:
+				return 'seer';
+			case 1:
+				return 'wolf';
+			case 2:
+				return 'cursed';
+			case 3:
+				return 'drunk';
+			case 4:
+				return 'harlot';
+			case 5:
+				return 'traitor';
+			case 6:
+				return 'gunner';
+			case 7:
+				return 'crow';
+			case 8:
+				return 'angel';
+			case 9:
+				return 'detective';
+			case 10:
+				return 'ghost';
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Get the ID of a role
+	 * 
+	 * This function is like an ENUM, but PHP does not support enum blocks
+	 * 
+	 * @param mixed $role Role name
+	 * @return int ID of role
+	 */
+	public function getRoleID($role) {
+		switch($role) {
+			case 'seer':
+				return 0;
+			case 'wolf':
+				return 1;
+			case 'cursed':
+				return 2;
+			case 'drunk':
+				return 3;
+			case 'harlot':
+				return 4;
+			case 'traitor':
+				return 5;
+			case 'gunner':
+				return 6;
+			case 'crow':
+				return 7;
+			case 'angel':
+				return 8;
+			case 'detective':
+				return 9;
+			case 'ghost':
+				return 10;
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Returns the reaction to a scenario
+	 * 
+	 * @param mixed $action The action that is performed
+	 * @param mixed $reaction The reaction to the action
+	 */
+	public function chance($action) {
+		$gun_shot = $this->setting["gun_shot"];
+		$gun_shot_drunk = $this->setting["gun_shot_drunk"];
+		$manslaughter = $this->setting["manslaughter"];
+
+		$guardian_angel_dies = $this->setting["guardian_angel_dies"];
+		$detective_revealed = $this->setting["detective_revealed"];
+
+		switch ($action) {
+			case 'gun_shot':
+				$spin = $this->random->getRandInt(1, $gun_shot[0][1]);
+				if ($spin <= $gun_shot[0][0]) {
+					return 1;
+				} else if ($spin <= $gun_shot[0][0] + $gun_shot[1][0]) {
+					return 2;
+				} else if ($spin <= $gun_shot[0][0] + $gun_shot[1][0] + $gun_shot[2][0]) {
+					return 3;
+				}
+			break;
+
+			case 'gun_shot_drunk':
+				$spin = $this->random->getRandInt(1, $gun_shot_drunk[0][1]);
+				if ($spin <= $gun_shot_drunk[0][0]) {
+					return 1;
+				} else if ($spin <= $gun_shot_drunk[0][0] + $gun_shot_drunk[1][0]) {
+					return 2;
+				} else if ($spin <= $gun_shot_drunk[0][0] + $gun_shot_drunk[1][0] + $gun_shot_drunk[2][0]) {
+					return 3;
+				}
+			break;
+
+			case 'manslaughter':
+				$spin = $this->random->getRandInt(1, $manslaughter[1]);
+				if ($spin <= $manslaughter[0]) {
+					return true;
+				} else {
+					return false;
+				}
+			break;
+
+			case 'guardian_angel_dies':
+				$spin = $this->random->getRandInt(1, $guardian_angel_dies[1]);
+				if ($spin <= $guardian_angel_dies[0]) {
+					return true;
+				} else {
+					return false;
+				}
+			break;
+
+			case 'detective_revealed':
+				$spin = $this->random->getRandInt(1, $detective_revealed[1]);
+				if ($spin <= $detective_revealed[0]) {
+					return true;
+				} else {
+					return false;
+				}
+			break;
+
+			default:
+				return null;
+		}
+	}
+
+	/**
+	 * Return a list of all the players
+	 * 
+	 * @param boolean $wolf Add wolf role to other wolves
+	 * @param boolean $reset Reset Times
+	 * @param mixed $nick Nick of player to not add
+	 * @return mixed List of players
+	 */
+	public function listPlayers($wolf = false, $nick = null) {
+
+		$list = "";
+		foreach(array_keys($this->players) as $player) {
+			if ($player != $nick) {
+				$list = $list . $player;
+
+				// Display wolves as their role
+				if ($wolf) {
+					if ( in_array($player, $this->wolf) ) {
+						$list = $list . ' (' . $this->string('wolf') . ')';
+					} else if ( in_array($player, $this->traitor) ) {
+						$list = $list . ' (' . $this->string('traitor') . ')';
+					}
+				}
+
+				$list = $list . ', ';
+			}
+		}
+		return substr($list, 0, -2);
+	}
+
+	public function resetPlayerTimeouts() {
+		foreach($this->players as &$value) {
+			$value = time();
+		}
+	}
+
+	/**
+	 * Send a message to the rest of the wolves
+	 * 
+	 * @param mixed $send Nickname of sender
+	 * @param mixed $message Message being sent
+	 */
+	public function relayToWolves($sender, $message) {
+		foreach($this->wolf as $wolf) {
+			if ($wolf != $sender) {
+				$wolf_relay = $this->string('wolf_relay', $sender, $message);
+				$this->say($wolf, $wolf_relay);
+			}
+		}
+		foreach($this->traitor as $traitor) {
+			if ($traitor != $sender) {
+				$wolf_relay = $this->string('wolf_relay', $sender, $message);
+				$this->say($traitor, $wolf_relay);
+			}
+		}
+	}
+
+	public function generateEndMessage() {
+		foreach($this->role_names as $role) {
+
+			$amount = count($this->$role);
+
+			if ( $amount == 0) {
+				continue;
+			}
+
+			$list = '';
+			$i = 1;
+
+			foreach($this->$role as $person) {
+				if ($amount >= 1 && $i != 1) {
+					if ($amount > 2)
+						$list .= ', ';
+					else if ($amount == 2)
+						$list .= ' ';
+					if ($i == $amount)
+						$list .= 'and ';
+				}
+
+				$list .= chr(2) . $person . chr(2);
+
+				$i++;
+			}
+
+			if ($amount > 1) {
+				$this->roles_message .= $this->string('end_roles_plural', $this->string($role . '_plural'), $list) . ' ';
+			} else {
+				$this->roles_message .= $this->string('end_roles', $this->string($role), $list) . ' ';
+			}
+		}
+		$this->roles_message = substr($this->roles_message, 0, -1); // remove trailing space
+	}
+
+	/**
+	 * Run the corresponding command
+	 *
+	 * @param mixed $recipient A #room or user
+	 * @param mixed $message Message to send
+	 * @param mixed $nick Nickname of sender
+	 * @param mixed $host Host of sender
+	 */
+	public function commands($recipient, $message, $nick, $host) {
+
+		// Remove double, extraneous whitespaces
+		$message = preg_replace("/\s+/", " ", $message);
+		if ( substr($message, -1, 1) == " " ) {
+			$message = substr($message, 0, -1);
+		}
+
+		// Split into a command, and its parameters ($message)
+		if ( strpbrk(" ", $message) ) {
+			$ex_message = explode(" ", $message, 2);
+			$command=$ex_message["0"];
+			// This doesn't avoid double space
+			if ( !empty($ex_message["1"]) ) {
+				$message=$ex_message["1"];
+			} else {
+				$message="";
+			}
+		} else {
+			$command=$message;
+			$message="";
+		}
+
+		// !help
+		if ( $this->isCommand($command, 'help') ) {
+			$help = $this->string('help');
+			$this->say($nick, $help);
+		}
+
+		// !simple
+		else if ( $this->isCommand($command, 'simple') ) {
+			$this->say($nick, "This feature on phpwolf is not yet available.");
+		}
+
+		// !back
+		else if ( $this->isCommand($command, 'back') ) {
+			if (in_array($nick, $this->away)) {
+				$index = array_search($nick, $this->away);
+				unset($this->away[$index]);
+
+				$back = $this->string('back');
+				$this->notice($nick, $back);
+
+				file_put_contents($this->away_file, implode(',', $this->away) );
+			} else {
+				$not_away = $this->string('not_away');
+				$this->notice($nick, $not_away);
+			}
+		}
+
+		// !quit and !leave
+		else if ( ( $this->isCommand($command, 'quit') || $this->isCommand($command, 'leave') ) ) {
+			if (!$this->isPlaying($nick)) {
+				$not_playing_self=$this->string('not_playing_self');
+				$this->notice($nick, $not_playing_self);
+			} else {
+				// Send quit message
+				if ($this->ongoing) {
+					$answer = $this->getRolesNice(array(
+						'nick' => $nick,
+						'show_traitor' => true
+					));
+				} else {
+					$answer = "person";
+				}
+
+				$this->removePlayer($this->channel, $nick, $ghost = false);
+
+				$quit = $this->string('quit', $nick, $answer);
+				$this->say($this->channel, $quit);
+			}
+		}
+
+		// !stats
+		else if ( $this->isCommand($command, 'stats') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if (time() - $this->last_stats < $this->setting["wait_stats"]) {
+				$ratelimit = $this->string('ratelimit');
+				$this->notice($nick, $ratelimit);
+			} else {
+
+				// Get amount of players
+				$answer = count($this->players);
+				if ($answer == 0) {
+					// There are no users playing
+					$game_none = $this->string('game_none');
+					$this->notice($nick, $game_none);
+				} else {
+					// Ratelimit for stats
+					$this->last_stats = time();
+
+					// Return list of users and amount
+					$answer2 = $this->listPlayers();
+
+					$stats = $this->string('stats', $nick, $answer, $answer2);
+					$this->say($recipient, $stats);
+				}
+
+				if ($this->ongoing) {
+					$reply = '';
+					$specials_total = 0;
+
+					// TODO:
+					// 1. Plural support for "There is.." = "There are.."
+
+					foreach ($this->role_names as $role_name) {
+						$role_id = $this->getRoleID($role_name);
+						// ignore gunner and cursed, do not count them in specials_total either
+						if ($this->roles_set[$role_id] > 0 && $role_name != 'cursed' && $role_name != 'gunner' ) {
+							$amount = count($this->$role_name);
+
+							$specials_total = $specials_total + $amount; // Add to total
+
+							if ($amount == 0) {
+								$reply = $reply . 'no ' . $this->string($role_name . '_plural') . ', ';
+							} else if ($amount == 1) {
+								$reply = $reply . chr(2).$amount.chr(2) . ' ' . $this->string($role_name) . ', ';
+							} else {
+								$reply = $reply . chr(2).$amount.chr(2) . ' ' . $this->string($role_name . '_plural') . ', ';
+							}
+						}
+					}
+
+					$player_total = count($this->players);
+					$villagers_total = $player_total - $specials_total;
+
+					if ($villagers_total == 0) { 
+						$reply = substr($reply, 0, -2) . ' no ' . 'villager_plural';
+					} else if ($villagers_total == 1) {
+						$reply = substr($reply, 0, -2) . ' and ' . chr(2).$villagers_total.chr(2) . ' ' . $this->string('villager') . '.';
+					} else {
+						$reply = substr($reply, 0, -2) . ' and ' . chr(2).$villagers_total.chr(2) . ' ' . $this->string('villager_plural') . '.';
+					}
+
+					$stats_roles = $this->string('stats_roles', $nick, $reply);
+					$this->say($recipient, $stats_roles);
+				}
+
+			}
+
+		}
+
+		// !away
+		else if ( $this->isCommand($command, 'away') ) {
+			if (in_array($nick, $this->away)) {
+				$index = array_search($nick, $this->away);
+				unset($this->away[$index]);
+
+				$back = $this->string('back');
+				$this->notice($nick, $back);
+			} else {
+				array_push($this->away, $nick);
+
+				$away = $this->string('away');
+				$this->notice($nick, $away);
+			}
+
+			file_put_contents($this->away_file, implode(',', $this->away) );
+		}
+
+		// !ping
+		else if ( $this->isCommand($command, 'ping') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ($this->ongoing) {
+				$start_ongoing = $this->string('start_ongoing');
+				$this->notice($nick, $start_ongoing);
+			} else if (time() - $this->last_ping < $this->setting["wait_ping"]) {
+				$ratelimit = $this->string('ratelimit');
+				$this->notice($nick, $ratelimit);
+			} else {
+				$this->last_ping = time();
+
+				$list = "";
+				foreach($this->people as $person) {
+					if ( !in_array($person, $this->away) && !isset($this->players[$person]) ) {
+						$list = $list . $person . ' ';
+					}
+				}
+				$list = substr($list, 0, -1);
+				// This returns PING %answer% if $list is empty
+				$ping = $this->string('ping', $list);
+				$this->say($recipient, $ping);
+			}
+		}
+
+		// !start
+		else if ( $this->isCommand($command, 'start') ) {
+			$count = count($this->players);
+			$time = time() - $this->game_wait;
+
+			// There are no players
+			if ($count == 0) {
+				$game_none = $this->string('game_none');
+				$this->notice($nick, $game_none);
+			} 
+
+			// Time limit has not passed
+			else if ( $time < $this->setting["game_wait"] ) {
+				$game_wait = $this->string('game_wait', $this->setting["game_wait"] - $time);
+				$this->say($recipient, $game_wait);
+			}
+
+			// There are not a sufficient amount of players
+			else if ($count < $this->setting['min_players']) {
+				$game_required = $this->string('game_required', $nick);
+				$this->say($recipient, $game_required);
+			}
+
+			// Game has already started
+			else if ($this->ongoing) {
+				$start_ongoing = $this->string('start_ongoing', $nick);
+				$this->notice($nick, $start_ongoing);
+			}
+
+			// Sucess!
+			else {
+				// Loop through players to generate list
+				$answer = $this->listPlayers(false);
+
+				// Reset Player timeouts at beginning of game
+				$this->resetPlayerTimeouts();
+
+				$game_welcome = $this->string('game_welcome', $answer);
+				$this->say($recipient, $game_welcome);
+
+				$this->ongoing = true;
+				$this->sendData('MODE ' . $recipient . ' +m');
+
+				// Assign roles
+				$this->assignRoles();
+
+				// Send night message
+				$night_first = $this->string('night_first');
+				$this->say($recipient, $night_first);
+
+				// Set booleans for.... THE SUN
+				$this->isDay = false;
+				$this->isNight = true;
+
+				$this->current_night_start = time();
+
+				// Pre-Generate end message
+				$this->generateEndMessage();
+
+				// We do not want socket blocking for werewolf now
+				$this->irc->setBlocking(false);
+
+			}
+
+		}
+
+		// !retract
+		else if ( $this->isCommand($command, 'retract') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ($this->ongoing == false) {
+				$start_ongoing = $this->string('start_ongoing');
+				$this->notice($nick, $start_ongoing);
+			} else if (!$this->isPlaying($nick)) {
+				// This person is not playing, let's just ignore them
+			} else if ($this->isNight) {
+				$this->say($nick, "Error, it is not day time");
+			} else if (isset($this->lynch[$nick])) {
+				unset($this->lynch[$nick]);
+				$retract = $this->string('retract', $nick);
+				$this->say($recipient, $retract);
+			}
+		}
+
+		// !goat
+		else if ( $this->isCommand($command, 'goat') ) {
+			if ($this->ongoing == false){
+				$game_none = $this->string('game_none');
+				$this->say($recipient, $game_none);
+			} else if (!$this->isPlaying($nick)) {
+				$not_playing = $this->string('not_playing', $this->nickAutocomplete($message));
+				$this->say($recipient, $not_playing);
+			} else if ($this->isNight) {
+				$this->say($nick, "Sshh... the goats are sleeping.");
+			} else if ($this->goat_switch == false) {
+				$this->say($recipient, "That can only be done once per day.");
+			} else {
+				$goat = $this->string('goat', $nick, $this->nickAutocomplete($message));
+				$this->say($recipient, $goat);
+				$this->goat_switch = false;
+			}
+		}
+
+		// !votes
+		else if ( $this->isCommand($command, 'votes') ) {
+			if ($recipient == $this->bot["nick"]) {
+				// ignore
+			} else if (!$this->ongoing) {
+				$game_none = $this->string('game_none');
+				$this->notice($nick, $game_none);
+			} else if ($this->isNight) {
+				$votes_night = $this->string('votes_night');
+				$this->notice($nick, $votes_night);
+			} else if ( count($this->lynch) == 0 ) {
+				$votes_none = $this->string('votes_none', $nick);
+				$this->say($recipient, $votes_none);
+			} else {
+				foreach($this->lynch as $prosecutor => $defendor) {
+					if (isset($defendants[$defendor])) {
+						array_push($defendants[$defendor], $prosecutor);
+					} else {
+						$defendants[$defendor] = array($prosecutor);
+					}
+				}
+				$votes_list = '';
+				foreach ($defendants as $defendor => $prosecutors) {
+					$votes_list = $votes_list . $defendor . ': ' . count($prosecutors) . ' (' . implode(' ', $prosecutors) . ')' . ', ';
+				}
+				$votes_list = substr($votes_list, 0, -2);
+
+				if ($votes_list != false) {
+					$votes = $this->string('votes', $nick, $votes_list);
+					$this->say($recipient, $votes);
+
+					// players available to vote is subtracted from unexistant idle mechanism
+					$votes_required = floor(count($this->players) / 2) + 1 - count($this->gunner_shot);
+					$votes_available = count($this->players);
+
+					$votes_status = $this->string('votes_status', $nick, count($this->players), $votes_required, $votes_available);
+					$this->say($recipient, $votes_status);
+
+				} else {
+					// no votes yet
+				}
+			}
+		}
+
+		// !lynch
+		else if ( $this->isCommand($command, 'lynch') || $this->isCommand($command, 'vote') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if (!$this->ongoing) {
+				$game_none = $this->string('game_none');
+				$this->notice($nick, $game_none);
+			} else {
+				$message = explode(' ', $message, 2);
+				$victim = $this->nickAutocomplete($message["0"]);
+
+				if (!$this->isPlaying($nick)) {
+					// This person is not playing, let's just ignore them (and hope they go away)
+				} else if (empty($victim)) {
+					$m = "You must specify a victim.";
+					$this->notice($nick, $m);
+				} else if (!$this->isPlaying($victim)) {
+					$not_playing = $this->string('not_playing', $victim);
+					$this->notice($nick, $not_playing);
+				} else if ($this->isNight) {
+					$lynch_night = $this->string('lynch_night', $victim);
+					$this->notice($nick, $lynch_night);
+				} else if ( in_array($nick, $this->gunner_shot) ) {
+					$lynch_resting = $this->string('lynch_resting', $nick);
+					$this->say($recipient, $lynch_resting);
+				} else {
+					$this->lynch[$nick] = $victim;
+					$lynch = $this->string('lynch', $nick, $victim);
+					$this->say($recipient, $lynch);
+				}
+			}
+		}
+
+		// !coin
+		else if ( $this->isCommand($command, 'coin') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else {
+				$coin_toss = $this->string('coin_toss', $nick);
+				$this->say($recipient, $coin_toss);
+
+				$int = $this->random->getRandInt(1, 2);
+				if ($int == 1) {
+					$coin_land = $this->string('coin_land', "heads");
+					$this->say($recipient, $coin_land);
+				} else if ($int == 2) {
+					$coin_land = $this->string('coin_land', "tails");
+					$this->say($recipient, $coin_land);
+				} else {
+					$this->say($recipient, "There as an error retrieving random.org results.");
+				}
+			}
+		}
+
+		// !wait
+		else if ( $this->isCommand($command, 'wait') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ($this->ongoing == false) {
+				if ($this->wait_extended < $this->setting["game_add_wait_limit"]) {
+
+					$this->wait_extended += 1;
+					$this->game_wait += $this->setting["game_add_wait"];
+
+					$wait = $this->string('wait', $nick, $this->setting["game_add_wait"]);
+					$this->say($recipient, $wait);
+				} else {
+					$wait_reached = $this->string('wait_reached');
+					$this->say($recipient, $wait_reached);
+				}
+			} else {
+				$start_ongoing = $this->string('start_ongoing');
+				$this->notice($nick, $start_ongoing);
+			}
+		}
+
+		// !join
+		else if ( $this->isCommand($command, 'join') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ($this->ongoing) {
+				$start_ongoing = $this->string('start_ongoing', $nick);
+				$this->notice($nick, $start_ongoing);
+			} else if ( isset($this->players[$nick]) ) {
+				$join_already_playing = $this->string('join_already_playing');
+				$this->notice($nick, $join_already_playing);
+			} else {
+				$this->addPlayer($recipient, $nick);
+
+				// No players have joined yet. Start a game.
+				if ( count($this->players) == 1 ) {
+					$this->channel = $recipient;
+					$game_start = $this->string('game_start', $nick);
+					$this->say($recipient, $game_start);
+					$this->game_wait = time();
+				} else {
+					// There is more than one player
+					$join = $this->string('join', $nick);
+					$this->say($recipient, $join);
+				}
+			}
+
+		}
+
+		// !rules
+		else if ( $this->isCommand($command, 'rules') ) {
+			$rules_part1 = $this->string('rules_part1');
+			$this->say($recipient, $rules_part1);
+			$rules_part2 = $this->string('rules_part2');
+			$this->say($recipient, $rules_part2);
+		}
+
+		// !admins
+		else if ( $this->isCommand($command, 'admins') ) {
+			$this->say($recipient, "Snuupy is the man for that.");
+		}
+
+		/***** Admin commands *****/
+		// !msg
+		else if ( $this->isCommand($command, 'msg') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message, 2);
+			$this->say($message["0"], $message["1"]);
+		}
+
+		// !op
+		else if ( $this->isCommand($command, 'op') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) { 
+				$this->mode($recipient, '+o', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '+o', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '+o', $message["0"]);
+			}
+		}
+
+		// !deop
+		else if ( $this->isCommand($command, 'deop') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) { 
+				$this->mode($recipient, '-o', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '-o', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '-o', $message["0"]);
+			}
+		}
+
+		// !voice
+		else if ( $this->isCommand($command, 'voice') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) {
+				$this->mode($recipient, '+v', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '+v', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '+v', $message["0"]);
+			}
+		}
+
+		// !devoice
+		else if ( $this->isCommand($command, 'devoice') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) {
+				$this->mode($recipient, '-v', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '-v', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '-v', $message["0"]);
+			}
+		}
+
+		// !quiet
+		else if ( $this->isCommand($command, 'quiet') && $this->isAdmin($host)  ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) {
+				$this->mode($recipient, '+q', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '+q', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '+q', $message["0"]);
+			}
+		}
+
+		// !unquiet
+		else if ( $this->isCommand($command, 'unquiet') && $this->isAdmin($host) ) {
+			$message=explode(" ", $message);
+			if (empty($message["0"]) && $recipient != $nick) {
+				$this->mode($recipient, '-q', $nick);
+			} else if (count($message) >= 2) {
+				$this->mode($message["0"], '-q', $message["1"]);
+			} else if (count($message) >= 1 && $recipient != $nick) {
+				$this->mode($recipient, '-q', $message["0"]);
+			}
+		}
+
+		// !fstart
+		else if ( $this->isCommand($command, 'fstart') && $this->isAdmin($host) ) {
+			$this->game_wait = 0;
+			$this->commands($recipient, "!start", $nick, $host);
+		}
+
+		// !fstop
+		else if ( $this->isCommand($command, 'fstop') && $this->isAdmin($host) ) {
+			if ($this->ongoing) {
+				$this->endGame($this->channel);
+			} else {
+				foreach(array_keys($this->players) as $player) {
+					$this->removePlayer($this->channel, $player, $ghost = false);
+				}
+			}
+		}
+
+		// !fday
+		else if ( $this->isCommand($command, 'fday') && $this->isAdmin($host) ) {
+			if ($this->isNight && $this->ongoing) {
+				$length_night_original = $this->setting["length_night"];
+
+				$this->setting["length_night"] = 0;
+				$this->runMaintenance();
+				$this->setting["length_night"] = $length_night_original;
+			}
+		}
+
+		// !fnight
+		else if ( $this->isCommand($command, 'fnight') && $this->isAdmin($host) ) {
+			if ($this->isDay && $this->ongoing) {
+				$length_day_original = $this->setting["length_day"];
+
+				$this->setting["length_day"] = 0;
+				$this->runMaintenance();
+				$this->setting["length_day"] = $length_day_original;
+			}
+		}
+
+		// !fjoin
+		else if ( $this->isCommand($command, 'fjoin') && $this->isAdmin($host) ) {
+			// Trim off everything after a space
+			$space = strpos($message, " ");
+			if ($space !== false) {
+				$message = substr($message, 0, $space);
+			}
+
+			if ($message == "") {
+				$parameters=$this->string('parameters', $message);
+				$this->notice($nick, $parameters);
+			} else {
+				$ongoing = $this->ongoing;
+				$this->ongoing = false;
+				$this->commands($recipient, "!join", $message, $host);
+				$this->ongoing = $ongoing;
+			}
+		}
+
+		// !fquit and !fleave
+		else if ( ( $this->isCommand($command, 'fquit') || $this->isCommand($command, 'fleave') ) && $this->isAdmin($host) ) {
+			// Trim off everything after a space
+			$space = strpos($message, " ");
+			if ( $space !== false ) {
+				$message = substr($message, 0, $space);
+			}
+
+			if ($message == "") {
+				$parameters=$this->string('parameters', $message);
+				$this->notice($nick, $parameters);
+			} else {
+				$this->commands($recipient, "!quit", $message, $host);
+			}
+		}
+
+		// !fping
+		else if ( $this->isCommand($command, 'fping') && $this->isAdmin($host) ) {
+			$this->last_ping = time() - $this->setting["wait_ping"] - 1;
+			$this->commands($recipient, "!ping", $nick, $host);
+		}
+
+		// !fwait
+		else if ( $this->isCommand($command, 'fwait') && $this->isAdmin($host) ) {
+			$args = explode(' ', trim($message));
+			$time = $args[0];
+
+			// If parameter wasn't given, use default
+			if (!ctype_digit($time)) {
+				$time = $this->setting["game_add_wait"];
+			}
+
+			// Decrease amount of times wait was called if limit has reached
+			if ($this->wait_extended >= $this->setting["game_add_wait_limit"]) {
+				$this->wait_extended--;
+			}
+
+			// Temporarily change and store default game add wait time
+			$game_add_wait = $this->setting["game_add_wait"];
+			$this->setting["game_add_wait"] = $time;
+
+			$this->commands($recipient, "!wait", $nick, $host);
+
+			// Restore default game add wait time
+			$this->setting["game_add_wait"] = $game_add_wait;
+		}
+
+		// !fgoat
+		else if ( $this->isCommand($command, 'fstart') && $this->isAdmin($host) ) {
+			$this->goat_switch = true;
+			$this->commands($recipient, "!goat", $nick, $host);
+		}
+
+		// !frestart
+		else if ( $this->isCommand($command, 'frestart') && $this->isAdmin($host) ) {
+			// Hack from -> http://debuggable.com/posts/restarting-a-php-command-line-script:4988968d-b9d0-4fe8-af30-05544834cda3
+			//echo "\nphpwolf: RESTARTING";
+			//die(exec('php ' . str_replace(' ', '\ ', getcwd()) . '/' . implode(' ', $GLOBALS['argv']) . ' > /dev/null &'));
+		}
+
+		// !access
+		else if ( $this->isCommand($command, 'access') ) {
+			$args = explode(" ", $message);
+			if (count($args) < 2) {
+				if (isset($this->admins[$nick])) {
+					$message = $nick . ", You are a bot admin.";
+				} else {
+					$message = $nick . ", You are not a bot admin.";
+				}
+				$this->say($recipient, $message);
+			} else if (!$this->isAdmin($host) ) {
+				$this->say($recipient, $nick . ", You are not a bot admin.");
+			} else {
+				switch($args[0]) {
+					case '+admin':
+						array_push($this->admins, $args[1]);
+						$this->say($recipient, $nick . ", Operation executed successfully.");
+						break;
+					case '-admin':
+						$pos = array_search($args[1], $this->admins);
+						unset($this->admins[$pos]);
+						$this->say($recipient, $nick . ", Operation executed successfully.");
+						break;
+				}
+			}
+		}
+
+		// !execute
+		else if ( $this->isCommand($command, 'execute') && $this->isAdmin($host) ) {
+			$error = eval($message);
+			if ($error === false) {
+				$this->say($recipient, "An error occured in the eval'd code.");
+			}
+		}
+
+		// !language
+		else if ( $this->isCommand($command, 'language') && $this->isAdmin($host) ) {
+			// Trim off everything after the first space
+			if (strpos($message, " ")) {
+				$language = substr($message, 0, strpos($message, " "));
+			} else {
+				$language = $message;
+			}
+
+			$this->locale->setLanguage($language);
+		}
+
+		/***** Private Role Commands *****/
+		// !see
+		else if ( $this->isCommand($command, 'see', NO_OPERATOR) ) {
+			if ($recipient == $this->channel || $this->isDay) {
+				// ignore this, people are probably telling the seer to 'see' someone.
+			} else if ( !in_array($nick, $this->seer) ) {
+				$seer_see_not = $this->string('seer_see_not');
+				$this->say($nick, $seer_see_not);
+			} else if ( in_array($nick, $this->seer_seen) ) {
+				$seer_seen = $this->string('seer_seen');
+				$this->say($nick, $seer_seen);
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if (!$this->isPlaying($person)) {
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else if ( $nick == $person ) {
+					$seer_see_self=$this->string('seer_see_self', $person);
+					$this->say($nick, $seer_see_self);
+				} else {
+					// parse this person
+					$person_roles = $this->getRolesNice(array(
+						'nick' => $person,
+						'cursed_wolf' => true
+					));
+
+					// Tell the seer who this guy is
+					$seer_see = $this->string('seer_see', $person, $person_roles);
+					$this->say($nick, $seer_see);
+
+					// Add to list of seers that have seen tonight
+					array_push($this->seer_seen, $nick);
+				}
+			}
+		}
+
+		// !kill
+		else if ( $this->isCommand($command, 'kill', NO_OPERATOR) ) {
+			if ($recipient == $this->channel || $this->isDay ) {
+				// ignore this
+			} else if ( !in_array($nick, $this->wolf) ) {
+				$this->say($nick, "You are not a wolf. good thing too!");
+			} else if ( in_array($nick, $this->ghost_died) ) {
+				$this->say($nick, "You cannot kill a ghost! D'oh?!?!!");
+			} else if (isset($this->crow_observed[$nick])) {
+				// User has already observed
+				$crow_observed = $this->string('crow_observed', $this->crow_observed[$nick]);
+				$this->say($nick, $crow_observed);
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if (!$this->isPlaying($person)) {
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else {
+					// Check if the victim is a wolf
+					if ($nick == $person) {
+						$wolf_kill_self = $this->string('wolf_kill_self');
+						$this->say($nick, $wolf_kill_self);
+					} else if (in_array($person, $this->wolf)) {
+						$this->say($nick, "You can't kill a wolf!");
+					} else {
+						// This person has been selected for death.
+						$this->wolf_killed[$nick] = $person;
+
+						// Send Message
+						$wolf_kill = $this->string('wolf_kill', $person);
+						$this->say($nick, $wolf_kill);
+					}
+				}
+			}
+		}
+
+		// !visit
+		else if ( $this->isCommand($command, 'visit', NO_OPERATOR) ) {
+			if ($recipient == $this->channel) {
+				// ignore this
+			} else if ($this->isDay) {
+				// It's daytime
+				$harlot_day=$this->string('harlot_day');
+				$this->notice($nick, $harlot_day);
+			} else if ( !in_array($nick, $this->harlot) ) {
+				// This person isn't the harlot
+				$harlot_visit_not=$this->string('harlot_visit_not', $person);
+				$this->notice($nick, $harlot_visit_not);
+			} else if ( isset($this->harlot_visited[$nick])) {
+				// You've already visited
+				$harlot_visited=$this->string('harlot_visited', $this->harlot_visited[$nick]);
+				$this->notice($nick, $harlot_visited);
+			} else if ( in_array($nick, $this->ghost_died) ) {
+				// Ghosts cannot be visited
+				$this->say($nick, "You cannot visit a ghost!");
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if ( !$this->isPlaying($person) ) {
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else {
+					// This person has been selected for death.
+					$this->harlot_visited[$nick] = $person;
+
+					if ($nick == $person) {
+						// harlot is visiting themselves
+						$harlot_visit_self=$this->string('harlot_visit_self');
+						$this->notice($nick, $harlot_visit_self);
+					} else {
+						// Send Message
+						$harlot_visit = $this->string('harlot_visit', $person);
+						$this->say($nick, $harlot_visit);
+
+						// Send Message to hostess
+						$harlot_visit = $this->string('harlot_visit', $nick);
+						$this->say($person, $harlot_visit);
+					}
+
+				}
+			}
+		}
+
+		// !shoot
+		else if ( $this->isCommand($command, 'shoot') ) {
+			if ($recipient == $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ( !in_array($nick, $this->gunner) ) {
+				// This person isn't the gunner
+				$gunner_shoot_not=$this->string('gunner_shoot_not');
+				$this->notice($nick, $gunner_shoot_not);
+			} else if ($this->isNight) {
+				// It is nighttime, you can't aim!
+				$gunner_night=$this->string('gunner_night');
+				$this->notice($nick, $gunner_night);
+			} else if ( empty($this->gunner_bullets[$nick]) )  {
+				// You've ran out of bullets!
+				$gunner_nobullets=$this->string('gunner_nobullets');
+				$this->say($nick, $gunner_nobullets);
+			} else if ( in_array($nick, $this->ghost_died) ) {
+				// Ghosts can not be shot
+				$this->say($this->channel, $nick . ", Don't waste precious bullets! Why, they'll go right through him/her!");
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if ( !$this->isPlaying($person) ) {
+					// The shot person isn't playing
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else if ($nick == $person) {
+					// You can't shoot yourself
+					$gunner_shoot_self=$this->string('gunner_shoot_self');
+					$this->say($recipient, $gunner_shoot_self);
+				} else {
+					$this->gunner_bullets[$nick]--;
+
+					if ( in_array($nick, $this->drunk) ) {
+						$event = $this->chance("gun_shot_drunk");
+					} else {
+						$event = $this->chance("gun_shot");
+					}
+
+					if ($event == 1) {
+						// Hit!
+						$gunner_shoot = $this->string('gunner_shoot', $nick, $person);
+						$this->say($recipient, $gunner_shoot);
+
+						if ( in_array($person, $this->wolf) ) {
+							$gunner_shoot_wolf = $this->string('gunner_shoot_wolf', $person);
+							$this->say($recipient, $gunner_shoot_wolf);
+
+							$this->removePlayer($this->channel, $person);
+						} else {
+							if ($this->chance("manslaughter")) {
+								$gunner_shoot_manslaughter = $this->string('gunner_shoot_manslaughter', $person);
+								$this->say($recipient, $gunner_shoot_manslaughter);
+
+								$roles = $this->getRolesNice(array(
+									'nick' => $person,
+									'show_traitor' => true
+								));
+								$gunner_reveal = $this->string('gunner_reveal', $roles);
+								$this->say($recipient, $gunner_reveal);
+
+								$this->removePlayer($this->channel, $person);
+							} else {
+								$gunner_shoot_villager = $this->string('gunner_shoot_villager', $person);
+								$this->say($recipient, $gunner_shoot_villager);
+
+								array_push($this->gunner_shot, $person);
+							}
+						}
+					} else if ($event == 2) {
+						// Miss!
+						$gunner_miss = $this->string('gunner_miss', $nick);
+						$this->say($recipient, $gunner_miss);
+					} else if ($event == 3) {
+						// Suicide!
+						$gunner_suicide = $this->string('gunner_suicide', $nick);
+						$this->say($recipient, $gunner_suicide);
+
+						$this->removePlayer($this->channel, $nick);
+					}
+				}
+			}
+		}
+
+		// !observe
+		else if ( $this->isCommand($command, 'observe', NO_OPERATOR) ) {
+			if ($recipient == $this->channel) {
+				// ignore this
+			} else if ( !in_array($nick, $this->crow) ) {
+				$crow_not = $this->string('crow_not');
+				$this->say($nick, $crow_not);
+			} else if ($this->isDay) {
+				$crow_observe_day = $this->string('crow_observe_day');
+				$this->say($nick, $crow_observe_day);
+			} else if (isset($this->wolf_killed[$nick])) {
+				// User has already killed
+				$crow_killed = $this->string('crow_killed', $this->wolf_killed[$nick]);
+				$this->say($nick, $crow_killed);
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if (!$this->isPlaying($person)) {
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else {
+					if ($nick == $person) {
+						// You can't kill yourself
+						$crow_observe_self = $this->string('crow_observe_self');
+						$this->say($nick, $crow_observe_self);
+					} else if (in_array($person, $this->wolf)) {
+						// You can't kill another wolf
+						$crow_observe_wolf = $this->string('crow_observe_wolf');
+						$this->say($nick, $crow_observe_wolf);
+					} else if (in_array($person, $this->crow)) {
+						// You can't kill another crow
+						$crow_observe_crow = $this->string('crow_observe_crow');
+						$this->say($nick, $crow_observe_crow);
+					} else {
+						// This person has been selected for observation.
+						$this->crow_observed[$nick] = $person;
+
+						// Send Message
+						$crow_observe = $this->string('crow_observe', $person);
+						$this->say($nick, $crow_observe);
+					}
+				}
+			}
+		}
+
+		// !guard
+		else if ( $this->isCommand($command, 'guard', NO_OPERATOR) ) {
+			if ($recipient != $this->bot["nick"]) {
+				// ignore this
+			} else if ( !in_array($nick, $this->angel) ) {
+				// This person isn't the angel
+				$angel_guard_not=$this->string('angel_guard_not');
+				$this->notice($nick, $angel_guard_not);
+			} else if ($this->isDay) {
+				// It's daytime
+				$angel_day=$this->string('angel_day');
+				$this->notice($nick, $angel_day);
+			} else if ( isset($this->angel_guarded[$nick]) ) {
+				// You've already guarded
+				$angel_guarded=$this->string('angel_guarded', $this->angel_guarded[$nick]);
+				$this->say($nick, $angel_guarded);
+			} else if ( in_array($nick, $this->ghost_died) ) {
+				// Ghosts can not be guarded
+				$this->say($nick, "You cannot guard a ghost!");
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if ( !$this->isPlaying($person) ) {
+					// The visited guarding person isn't playing
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else if ($nick == $person) {
+					// Guarding self isn't allowed
+					$angel_guard_self=$this->string('angel_guard_self');
+					$this->say($nick, $angel_guard_self);
+				} else {
+					// This person has been selected for death.
+					$this->angel_guarded[$nick] = $person;
+
+					// Send Message
+					$angel_guard = $this->string('angel_guard', $person);
+					$this->say($nick, $angel_guard);
+
+					// Send Message to protected villager
+					$angel_guard_notify = $this->string('angel_guard_notify', $nick);
+					$this->say($person, $angel_guard_notify);
+
+				}
+			}
+		}
+
+		// !id
+		else if ( $this->isCommand($command, 'id') ) {
+			if ($recipient != $this->bot["nick"]) {
+				$this->say($nick, "This feature is not available in a pm.");
+			} else if ( !in_array($nick, $this->detective) ) {
+				// This person isn't the detective
+				$detective_id_not=$this->string('detective_id_not');
+				$this->say($nick, $detective_id_not);
+			} else if ($this->isNight) {
+				// It is nighttime, you can't see anything!
+				$detective_night=$this->string('detective_night');
+				$this->say($nick, $detective_night);
+			} else if ( in_array($nick, $this->detective_ided) )  {
+				// You've already seen!
+				$detective_ided=$this->string('detective_ided');
+				$this->say($nick, $detective_ided);
+			} else {
+				$person = $this->nickAutocomplete($message);
+
+				if ( !$this->isPlaying($person) ) {
+					// The shot person isn't playing
+					$not_playing=$this->string('not_playing', $person);
+					$this->notice($nick, $not_playing);
+				} else if ($nick == $person) {
+					// You can't id yourself
+					$detective_id_self=$this->string('detective_id_self');
+					$this->say($recipient, $detective_id_self);
+				} else {
+					array_push($this->detective_ided, $nick);
+
+					$roles = $this->getRolesNice(array(
+						'nick' => $person,
+						'show_cursed' => true,
+						'show_gunner' => true,
+						'show_traitor' => true,
+						'show_ghost' => true
+					));
+
+					$detective_id=$this->string('detective_id', $person, $roles);
+					$this->say($nick, $detective_id);
+
+					if ( $this->chance("detective_revealed") ) {
+						$detective_revealed=$this->string('detective_revealed', $nick);
+						foreach($this->wolf as $wolf) {
+							$this->say($wolf, $detective_revealed);
+						}
+						foreach($this->traitor as $traitor) {
+							$this->say($traitor, $detective_revealed);
+						}
+					}
+
+				}
+			}
+		}
+
+		// !whoami (needs official locale)
+		else if ( $this->isCommand($command, 'whoami', NO_OPERATOR) ) {
+			if (!$this->ongoing) {
+				//No game is currently running.
+				$this->say($nick, $this->string('game_none'));
+			} else if ( !$this->isPlaying($nick) ) {
+				$not_playing = $this->string('not_playing', $person);
+				$this->notice($nick, $not_playing);
+			} else {
+				$roles = $this->getRolesNice(array(
+					'nick' => $nick,
+					'show_gunner' => true,
+					'show_traitor' => true
+				));
+				$this->say($nick, "You currently hold the role(s): " . $roles );
+			}
+		}
+
+	}
+
+	/**
+	 * Add a player to the game
+	 * 
+	 * @param mixed $nick Nickname of player
+	 */
+	public function addPlayer($channel, $nick) {
+		$this->players[$nick] = time();
+		// Add Voice
+		$this->sendData("MODE $channel +v $nick");
+	}
+
+	/**
+	 * Remove a player from the game
+	 * 
+	 * @param mixed $nick Nickname of player
+	 */
+	public function removePlayer($channel, $nick, $ghost = true) {
+
+		// Check victim is ghost
+		if (in_array($nick, $this->ghost) && $ghost) {
+			$isGhost = true;
+		} else {
+			$isGhost = false;
+		}
+
+		// Remove player from all roles
+		foreach($this->role_names as $role) {
+			foreach($this->$role as $key => &$person) {
+				if ($nick == $person) {
+					unset($this->{$role}[$key]);
+				}
+			}
+		}
+
+		// Remove from wolf kills
+		foreach($this->wolf_killed as $wolf => &$victim) {
+			if ($nick == $victim) {
+				unset($this->wolf_killed[$wolf]);
+			}
+		}
+
+		// Remove from gunner shot
+		$search = array_search($nick, $this->gunner_shot);
+		if ($search !== false) {
+			unset($this->gunner_shot[$search]);
+		}
+
+		// Remove from harlot visited
+		foreach($this->harlot_visited as $harlot => &$person) {
+			if ($nick == $person) {
+				unset($this->harlot_visited[$harlot]);
+			}
+		}
+
+		// Remove from angel guarded
+		foreach($this->angel_guarded as $angel => &$person) {
+			if ($nick == $person) {
+				unset($this->angel_guarded[$angel]);
+			}
+		}
+
+		// Remove player's lynch
+		if (isset($this->lynch[$nick])) {
+			unset($this->lynch[$nick]);
+		}
+
+		// Remove lynches on player
+		foreach($this->lynch as $lyncher => $lynchee) {
+			if ($lynchee == $nick) {
+				unset($this->lynch[$lyncher]);
+			}
+		}
+
+		// Finally, remove player from game.
+		unset($this->players[$nick]);
+
+		// Remove voice
+		if (!$isGhost) {
+			$this->sendData("MODE $channel -v $nick");
+		} else {
+			// Otherwise... resurrect the ghost
+			$ghost_assign = $this->string('ghost_assign');
+			$this->say($nick, $ghost_assign);
+			
+			$ghost_transform = $this->string('ghost_transform', $nick);
+			$this->say($this->channel, $ghost_transform);
+			
+			array_push($this->ghost_died, $nick);
+		}
+
+	}
+
+	/**
+	 * Assign player roles
+	 */
+	public function assignRoles() {
+		$roles = $this->setting["roles"];
+
+		// Get the array of # of roles according to player amount
+		$player_amount = count($this->players);
+		foreach ($roles as $key => $value) {
+			if ( $player_amount >= $key ) {
+				$index = $key;
+			} else {
+				break;
+			}
+		}
+		$game_roles = $roles[$index];
+		$this->roles_set = $game_roles;
+
+		// Reconstruct players array
+		$i=0;
+		foreach(array_keys($this->players) as $key) {
+			$players_sorted[$i] = $key;
+			$i++;
+		}
+
+		// Start looping through each role and assign them
+		foreach($game_roles as $role => $amount) {
+
+			$role_name = $this->getRoleByID($role);
+			echo "\n$role_name : ";
+
+			// Assign each role the proper amount of times
+			for($i=1; $i <= $amount; $i++) {
+
+				// Loop until role is given to proper candidate
+				// NOTE: This will result in an infinite loop if settings are manipulated wrong (ex: more roles than players)
+				while(true) {
+					echo "Finding $role_name";
+					// Player index to receive role
+					$player_index = $this->random->getRandInt(0, $player_amount-1);
+					echo ": $players_sorted[$player_index]\n";
+
+					// Do not assign if it's already assigned
+					if ( in_array($players_sorted[$player_index], $this->$role_name) ) {
+						continue;
+					}
+
+					// Exception: Ghost can be anyone! Just can't have it already
+					if ($role_name == 'ghost') {
+						array_push($this->ghost, $players_sorted[$player_index]);
+						break;
+					}
+
+					// If the person is a seer, only give them gunner
+					if ( in_array($players_sorted[$player_index], $this->seer) && $role_name != 'gunner' ) {
+						continue;
+					}
+					// If the person is a drunk, only give them gunner
+					if ( in_array($players_sorted[$player_index], $this->drunk) && $role_name != 'gunner' ) {
+						continue;
+					}
+					// If the person is cursed, only give them traitor
+					if ( in_array($players_sorted[$player_index], $this->cursed) && $role_name != 'gunner' ) {
+						continue;
+					}
+					// If the person is already harlot, traitor, angel, or detective, do not give them another role
+					if ( in_array($players_sorted[$player_index], $this->harlot) ||
+						 in_array($players_sorted[$player_index], $this->angel) ||
+						 in_array($players_sorted[$player_index], $this->traitor) ||
+						 in_array($players_sorted[$player_index], $this->detective) )
+					{
+						continue;
+					}
+					// If the person is a wolf, they can't have anything else
+					if ( in_array($players_sorted[$player_index], $this->wolf) ) {
+						continue;
+					}
+
+					// Conditions satisfied, give another role!
+					array_push($this->$role_name, $players_sorted[$player_index]);
+
+					if ($role_name == "gunner") {
+						$this->gunner_bullets[$players_sorted[$player_index]] = ceil($this->setting["shots_multiplier"] * count($this->players) );
+					}
+
+					break;
+				}
+			}
+		}
+		// Roles have all been assigned, we can now send directions
+		foreach ($this->role_names as $role) {
+			if (count($this->$role) > 0) {
+				foreach ($this->$role as $player) {
+					$this->sendDirections($player, $role);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Send the role directions to the assigned player
+	 * 
+	 * @param mixed $nick Nickname of player
+	 * @param mixed $role Role player has been assigned
+	 */
+	public function sendDirections($nick, $role) {
+
+		switch($role) {
+			case 'seer': // Seer
+				// Role Assign
+				$seer_assign = $this->string('seer_assign');
+				$this->say($nick, $seer_assign);
+
+				// List players
+				$answer=$this->listPlayers(false, $nick);
+				$players_list = $this->string('players_list', $answer);
+				$this->say($nick, $players_list);
+			break;
+
+			case 'wolf': // Wolf
+				// Role Assign
+				$wolf_assign = $this->string('wolf_assign');
+				$this->say($nick, $wolf_assign);
+
+				// Multiple wolves relay message
+				if (count($this->wolf) + count($this->traitor) > 1) {
+					$wolf_multiple = $this->string('wolf_multiple');
+					$this->say($nick, $wolf_multiple);
+				}
+
+				// List players
+				$answer=$this->listPlayers(true, $nick);
+				$players_list = $this->string('players_list', $answer);
+				$this->say($nick, $players_list);
+			break;
+
+			case 'cursed': // Cursed
+				// Do not say anything to the cursed
+			break;
+
+			case 'drunk': // Drunk
+				// Role Assign
+				$drunk_assign = $this->string('drunk_assign');
+				$this->say($nick, $drunk_assign);
+			break;
+
+			case 'harlot': // Harlot
+				// Role Assign
+				$harlot_assign = $this->string('harlot_assign');
+				$this->say($nick, $harlot_assign);
+
+				// List players
+				$answer=$this->listPlayers(false, $nick);
+				$players_list = $this->string('players_list', $answer);
+				$this->say($nick, $players_list);
+			break;
+
+			case 'traitor': // Traitor
+				// Role Assign
+				$traitor_assign = $this->string('traitor_assign');
+				$this->say($nick, $traitor_assign);
+
+				// Multiple wolves relay message
+				if (count($this->wolf) + count($this->traitor) > 1) {
+					$wolf_multiple = $this->string('wolf_multiple');
+					$this->say($nick, $wolf_multiple);
+				}
+
+				// List players
+				$answer=$this->listPlayers(true, $nick);
+				$players_list = $this->string('players_list', $answer);
+				$this->say($nick, $players_list);
+			break;
+
+			case 'gunner': // Gunner
+				// Role Assign
+				$gunner_assign = $this->string('gunner_assign', $this->gunner_bullets[$nick]);
+				$this->say($nick, $gunner_assign);
+			break;
+
+			case 'crow': // Crow
+				// There is no crow yet
+			break;
+
+			case 'angel': // Angel
+				// Role Assign
+				$angel_assign = $this->string('angel_assign');
+				$this->say($nick, $angel_assign);
+
+				// List players
+				$answer=$this->listPlayers(false, $nick);
+				$players_list = $this->string('players_list', $answer);
+				$this->say($nick, $players_list);
+			break;
+
+			case 'detective': // Detective
+				// Role Assign
+				$detective_assign = $this->string('detective_assign');
+				$this->say($nick, $detective_assign);
+
+				$detective_assign2 = $this->string('detective_assign2');
+				$this->say($nick, $detective_assign2);
+
+				$detective_assign3 = $this->string('detective_assign3');
+				$this->say($nick, $detective_assign3);
+			break;
+
+			case 'ghost':
+				// Ghost does not get directions
+			break;
+		}
+	}
+
+	/**
+	 * Turns the game into day mode
+	 * 
+	 * @param mixed $victim The victim wolves slected for death (NULL for none)
+	 * @param mixed $lasted_time Time night lasted for
+	 */
+	public function turnDay($lasted_time, $victim = null) {
+
+		$this->night_time = $this->night_time + $lasted_time;
+		$day_turn = $this->string('day_turn', $this->formatSeconds($lasted_time));
+		$this->say($this->channel, $day_turn);
+
+		if ($victim == null) {
+			$day_nokill = $this->string('day_nokill');
+			$this->say($this->channel, $day_nokill);
+
+		// If the harlot is selected, and he/she is not home...
+		} else if ( isset($this->harlot_visited[$victim]) && $this->harlot_visited[$victim] != $victim && in_array($victim, $this->harlot) ) {
+			$day_harlot = $this->string('day_harlot');
+			$this->say($this->channel, $day_harlot);
+
+		// Victim was protected by GA
+		} else if ( in_array($victim, $this->angel_guarded) ) {
+			$day_angel = $this->string('day_angel', $victim);
+			$this->say($this->channel, $day_angel);
+
+		} else {
+			$dead_guy_roles = $this->getRolesNice(array(
+				'nick' => $victim,
+				'show_traitor' => true
+			));
+
+			$day_victim = $this->string('day_victim', $victim, $dead_guy_roles);
+			$this->say($this->channel, $day_victim);
+
+			$this->removePlayer($this->channel, $victim);
+
+			// Check if harlot visited victim
+			foreach($this->harlot as $harlot) {
+				if ( isset($this->harlot_visited[$harlot]) && $this->harlot_visited[$harlot] == $victim ) {
+					$harlot_dead = $this->string('harlot_dead', $harlot);
+					$this->say($this->channel, $harlot_dead);
+					$this->removePlayer($this->channel, $harlot);
+				}
+			}
+		}
+
+		// If the harlot visits a wolf!
+		foreach($this->harlot as $harlot) {
+			if ( isset($this->harlot_visited[$harlot]) && in_array($this->harlot_visited[$harlot], $this->wolf) ) {
+				$day_harlot_dead = $this->string('day_harlot_dead', $harlot);
+				$this->say($this->channel, $day_harlot_dead);
+				$this->removePlayer($this->channel, $harlot);
+			}
+		}
+
+		// If the GA guards a wolf!
+		foreach($this->angel as $angel) {
+			// 50% chance of death
+			if ( $this->chance('guardian_angel_dies') ) {
+				if ( isset($this->angel_guarded[$angel]) && in_array($this->angel_guarded[$angel], $this->wolf) ) {
+					$day_angel_dead = $this->string('day_angel_dead', $angel);
+					$this->say($this->channel, $day_angel_dead);
+					$this->removePlayer($this->channel, $angel);
+				}
+			}
+		}
+
+		// Send results of crow observation
+		foreach($this->crow_observed as $crow => $target) {
+			if (in_array($target, $this->seer_seen) ||
+					in_array($target, $this->wolf_killed) ||
+					in_array($target, $this->harlot_visited) ||
+					in_array($target, $this->angel_guarded) ||
+					in_array($target, $this->detective_ided) ) {
+				$crow_result = $this->string('crow_observed_got_up', $target);
+			} else {
+				$crow_result = $this->string('crow_observed_stayed', $target);
+			}
+			$this->say($crow, $crow_result);
+		}
+
+		// Night has ended, we can reset the night actions
+		$this->seer_seen = array();
+		$this->wolf_killed = array();
+		$this->harlot_visited = array();
+		$this->crow_observed = array();
+		$this->angel_guarded = array();
+
+		// Check if game has finished
+		if (count($this->wolf) == 0 && count($this->traitor) == 0) {
+			// All evildoers are dead
+			$this->endGame($this->channel, 1);
+		} else if (count($this->players) / 2 <= count($this->wolf) + count($this->traitor) ) {
+			// Wolves equal villagers
+			$this->endGame($this->channel, 2);
+		} else {
+			$amount = count($this->players);
+
+			// If the number is odd, subtract 1
+			if ($amount % 2 != 0) {
+				$amount--;
+			}
+			// Lynch message, and how many required to kill a victim.
+			$day_vote = $this->string('day_vote', $amount / 2 + 1);
+			$this->say($this->channel, $day_vote);
+
+			// Set booleans for.... THE SUN
+			$this->isDay = true;
+			$this->isNight = false;
+			$this->gaveNightWarning = false;
+
+			$this->current_night_start = false;
+			$this->current_day_start = time();
+		}
+	}
+
+	/**
+	 * Turns the game into day mode
+	 *
+	 * @param mixed $victim The lynch victim
+	 * @param mixed $lasted_time Time day lasted for
+	 */
+	public function turnNight($lasted_time, $victim = null) {
+
+		// Day has ended, we can reset these actions
+		// NOTE: Do not reset gunner shots
+		$this->detective_ided = array();
+
+		// Clear lynches
+		$this->lynch = array();
+
+		// Reset goat
+		$this->goat_switch = true;
+
+		if ($victim == null) {
+			// I don't believe there's a message for no kill at night
+			/*$night_nokill = $this->string('night_nokill');
+			$this->say($this->channel, $night_nokill);*/
+		} else {
+			$dead_guy_roles = $this->getRolesNice(array(
+				'nick' => $victim,
+				'show_traitor' => true
+			));
+
+			$night_victim = $this->string('night_victim', $victim, $dead_guy_roles);
+			$this->say($this->channel, $night_victim);
+			$this->removePlayer($this->channel, $victim);
+		}
+
+		// Check if game has finished
+		if (count($this->wolf) == 0 && count($this->traitor) == 0) {
+			// All evildoers are dead
+			$this->endGame($this->channel, 1);
+		} else if (count($this->players) / 2 <= count($this->wolf) + count($this->traitor) ) {
+			// Wolves equal villagers
+			$this->endGame($this->channel, 2);
+		} else {
+			// No more wolves, traitor transforms
+			if (count($this->wolf) == 0 && count($this->traitor) > 0) {
+				$traitor_transform = $this->string('traitor_transform');
+				$this->say($this->channel, $traitor_transform);
+
+				// Transform traitor and tell them
+				$lucky_traitor = reset($this->traitor);
+				array_push($this->wolf, $lucky_traitor);
+				$traitor_notify = $this->string('traitor_notify');
+				$this->say($lucky_traitor, $traitor_notify);
+				unset($this->traitor[key($this->traitor)]);
+			}
+
+			$this->day_time = $this->day_time + $lasted_time;
+			$night_turn = $this->string('night_turn', $this->formatSeconds($lasted_time));
+			$this->say($this->channel, $night_turn);
+
+			// Set booleans for.... THE SUN
+			$this->isDay = false;
+			$this->isNight = true;
+			$this->gaveDayWarning = false;
+
+			$this->current_day_start = null;
+			$this->current_night_start = time();
+
+			foreach($this->role_names as $role) {
+				if (count($this->$role) > 0) {
+					foreach($this->$role as $person) {
+						$this->sendDirections($person, $role);
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * End the game
+	 * 
+	 * @param mixed $channel Channel game is operating in
+	 * @param mixed $win 0 no win, 1 for villagers, 2 for wolves, 3 for all wolves dead
+	 */
+	public function endGame($channel, $win=0) {
+
+		// Game stopped, we can start blocking the socket again
+		$this->irc->setBlocking(true);
+
+		// If !fstop is being used, time should be considered for current night/day time
+		if ($this->isDay == true) {
+			$lasted_time = time() - $this->current_day_start;
+			$this->day_time += $lasted_time;
+		} else {
+			$lasted_time = time() - $this->current_night_start;
+			$this->night_time += $lasted_time;
+		}
+
+		// No game is running now
+		$this->ongoing = false;
+
+		// Game over message here
+		if ($win == 0) {
+			// No win
+		} else if ($win == 1) {
+			$win_villagers = $this->string('win_villagers');
+			$this->say($channel, $win_villagers);
+		} else if ($win == 2) {
+			$win_wolves = $this->string('win_wolves');
+			$this->say($channel, $win_wolves);
+		}
+
+		// Time and portions
+		$total = $this->day_time + $this->night_time;
+		$end_times = $this->string('end_times', $this->formatSeconds($total), $this->formatSeconds($this->day_time), $this->formatSeconds($this->night_time));
+		$this->say($channel, $end_times);
+
+		// Send previously generated roles message
+		$this->say($channel, $this->roles_message);
+
+		// Unmute the channel
+		$this->sendData('MODE ' . $channel . ' -m');
+
+		// Add ghosts back into players to remove their voice
+		foreach($this->ghost_died as $ghost) {
+			$this->players[$ghost] = 0;
+		}
+
+		// Generate list of players
+		$players_list = implode(' ', array_keys($this->players) );
+
+		$players_list_split = SplitByEveryNthOccurrence($players_list, ' ', 3);
+		foreach($players_list_split as $list) {
+			$devoice = '-';
+			for ($i=0; $i < count($this->players); $i++) {
+				$devoice = $devoice . 'v';
+			}
+			$this->sendData("MODE $channel $devoice $list");
+		}
+
+		// Clear players
+		$this->players = array();
+		$this->lynch = array();
+
+		$this->wait_extended = 0;
+
+		// Clear all player roles
+		$this->seer = array();
+		$this->wolf = array();
+		$this->cursed = array();
+		$this->drunk = array();
+		$this->harlot = array();
+		$this->traitor = array();
+		$this->gunner = array();
+		$this->crow = array(); 
+		$this->angel = array();
+		$this->detective = array();
+		$this->ghost = array();
+
+		$this->seer_seen = array();
+		$this->wolf_killed = array();
+		$this->harlot_visited = array();
+		$this->gunner_shot = array();
+		$this->gunner_bullets = array();
+		$this->crow_observed = array();
+		$this->angel_guarded = array();
+		$this->detective_ided = array();
+		$this->ghost_died = array();
+
+		$this->roles_message = '';
+
+		$this->isDay = null;
+		$this->isNight = null;
+		$this->day_time = 0;
+		$this->night_time = 0;
+	}
+
+	/**
+	 * Run functions not invoked by messages
+	 */
+	public function runMaintenance() {
+
+		if (!$this->ongoing) {
+			return false;
+		}
+
+		// Check if game has finished
+		if (count($this->wolf) == 0 && count($this->traitor) == 0 ) {
+			// All evildoers are dead
+			$this->endGame($this->channel, 1);
+		} else if (count($this->wolf) == 0 && count($this->traitor) > 0) {
+			// No more wolves, traitor transforms
+			$traitor_transform = $this->string('traitor_transform');
+			$this->say($this->channel, $traitor_transform);
+
+			// Transform traitor and tell them
+			$lucky_traitor = reset($this->traitor);
+			array_push($this->wolf, $lucky_traitor);
+			$traitor_notify = $this->string('traitor_notify');
+			$this->say($lucky_traitor, $traitor_notify);
+			unset($this->traitor[key($this->traitor)]);
+		} else if (count($this->players) / 2 <= count($this->wolf) + count($this->traitor) ) {
+			// Wolves equal villagers
+			$this->endGame($this->channel, 2);
+		}
+
+		if ($this->isNight) {
+			// Has the time limit run out yet?
+			$lasted_time = time() - $this->current_night_start;
+
+			// Run a warning that day is approaching
+			if ( !$this->gaveNightWarning && ($lasted_time >= $this->setting['night_warn']) ) {
+				$night_warn = $this->string('night_warn');
+				$this->say($this->channel, $night_warn);
+				$this->gaveNightWarning = true;
+			}
+
+			// If the time limit has run out
+			if ($lasted_time >= $this->setting["length_night"]) {
+				$first_kill = reset($this->wolf_killed);
+				if ( !empty($first_kill) ) {
+					$this->turnDay($lasted_time, $first_kill);
+				} else {
+					$this->turnDay($lasted_time);
+				}
+			} else {
+
+				$i_role = 0;
+				$i_condition = 0;
+				foreach($this->role_names as $role) {
+					if (count($this->$role) > 0) {
+						if ($role == 'seer') {
+							if (count($this->seer_seen) == count($this->seer)) {
+								$i_condition++;
+							}
+						} else if ($role == 'wolf') {
+							if (count($this->wolf_killed) == count($this->wolf)) {
+								$i_condition++;
+							}
+						} else if ($role == 'harlot') {
+							if (count($this->harlot_visited) == count($this->harlot)) {
+								$i_condition++;
+							}
+						} else if ($role == 'angel') {
+							if (count($this->angel_guarded) == count($this->angel)) {
+								$i_condition++;
+							}
+						}
+
+						if ($role != 'drunk' && $role != 'cursed' &&
+								$role != 'traitor' && $role != 'gunner' &&
+								$role != 'detective' && $role != 'ghost') {
+							$i_role++;
+						}
+					}
+				}
+				if ($i_role == $i_condition) {
+					$this->turnDay( $lasted_time, reset($this->wolf_killed) );
+				}
+			}
+
+		} else if ($this->isDay) {
+			// Has the time limit run out yet?
+			$lasted_time = time() - $this->current_day_start;
+
+			// Run a warning that night is approaching
+			if ( !$this->gaveDayWarning && ($lasted_time >= $this->setting['day_warn']) ) {
+				$day_warn = $this->string('day_warn');
+				$this->say($this->channel, $day_warn);
+				$this->gaveDayWarning = true;
+			}
+
+			// If the time limit has run out
+			if ($lasted_time >= $this->setting["length_day"]) {
+				$this->turnNight($lasted_time);
+			} else {
+
+				foreach($this->lynch as $lyncher => $lynchee) {
+					if (isset($$lynchee)) {
+						$$lynchee = $$lynchee +1;
+					} else {
+						$$lynchee = 1;
+					}
+				}
+
+				// Lynch message, and how many required to kill a victim.
+				$amount = floor(count($this->players) / 2) + 1 - count($this->gunner_shot);
+				foreach(array_keys($this->players) as $player) {
+					if ( isset($$player) && $$player >= $amount) {
+						$lasted_time = time() - $this->current_day_start;
+						$this->turnNight($lasted_time, $player);
+					}
+				}
+
+			}
+		}
+
+		// This function is being repeated called, sleep for a hundreth of a second
+		sleep(1/100);
+
+	}
+
+	/**
+	 * Runs the bot functions
+	 *
+	 * @param Socket $socket Socket of IRC Class
+	 * @param array $data explodeData() return
+	 */
+	public function run($socket, $data) {
+
+		// Set the socket from the running instance
+		$this->setSocket($socket);
+
+		// Parse the data
+
+		// Remove unneeded newline colon at beginning
+		$smplf["0"]=substr($data["0"], 1);
+ 
+		if ( strpos($smplf["0"], "!") ) {
+			// Message from user
+			$username=explode("!", $smplf["0"]);
+			$nick=$username["0"];
+			$host=$username["1"];
+		} else {
+			// Message from server
+			$server = $smplf["0"];
+		}
+
+		if (!empty($data["1"])) {
+
+			$event = $data["1"];
+			switch($event) {
+				case 'PRIVMSG':
+					$recipient = $data["2"];
+					$implode=$data;
+					unset($implode["0"], $implode["1"], $implode["2"]);
+					$implode["3"] = substr($implode["3"], 1);
+
+					$message=implode(" ", $implode);
+
+					// Wolf relay for game
+					$totalBadGuys = count($this->wolf) + count($this->traitor) + count($this->crow);
+
+					if ($this->ongoing && $recipient == $this->bot["nick"] &&
+							$this->isBadGuy($nick) && $totalBadGuys > 1) {
+						$this->relayToWolves($nick, $message);
+					}
+
+					$this->commands($recipient, $message, $nick, $host);
+				break;
+				case 'KICK':
+					$nick = $data["3"];
+				case 'QUIT': // Alias PART
+				case 'PART':
+					// Remove from peoples list
+					$key = array_search($nick, $this->people);
+					unset($this->people[$key]);
+
+					$recipient = $data["2"];
+
+					// Quit update for game
+					if (isset($this->players[$nick])) {
+						$this->commands($recipient, "!quit", $nick, $host);
+					}
+				break;
+				case 'JOIN':
+					// Add to peoples list
+					if ($nick != $this->bot["nick"]) {
+						array_push($this->people, $nick);
+					}
+				break;
+				case 'NICK':
+					// Change nick in people list
+					$implode = implode(' ', $data);
+					$new_nick = explode(':', $implode);
+					$new_nick = end($new_nick);
+
+					$key = array_search($nick, $this->people);
+					$this->people[$key] = $new_nick;
+
+					// Nick update for game
+					if (isset($this->players[$nick])) {
+						$this->players[$new_nick] = $this->players[$nick];
+						unset($this->players[$nick]);
+					}
+					// Nick update for lynch
+					if (isset($this->lynch[$nick])) {
+						$this->lynch[$new_nick] = $this->lynch[$nick];
+						unset($this->lynch[$nick]);
+					}
+					// Nick update for away
+					if (isset($this->away[$nick])) {
+						$this->away[$new_nick] = $this->away[$nick];
+						unset($this->away[$nick]);
+					}
+
+					foreach($this->role_names as $role) {
+						foreach($this->$role as $key => &$person) {
+							if ($nick == $person) {
+								$this->{$role}[$key] = $new_nick;
+							}
+						}
+					}
+				break;
+				case '353': // RPL_NAMREPLY (list of people in channel)
+					$implode = implode(' ', $data);
+					$explode = explode(':', $implode, 3);
+					$people=explode(' ', $explode["2"]);
+
+					foreach($people as $value) {
+						if ( strpbrk('@', $value) || strpbrk('+', $value) ) {
+							$value = substr($value, 1);
+						}
+						if ($value != $this->bot["nick"]) {
+							array_push($this->people, $value);
+						}
+					}
+				break;
+			}
+
+		}
+	}
+
+}
+?>

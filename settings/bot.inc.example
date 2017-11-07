@@ -1,0 +1,27 @@
+<?php
+// Server configuration
+$server["address"]="irc.freenode.net";
+$server["port"]="6667";
+$server["password"]="";
+
+// Bot information configuration
+$user["nick"]="phpwolf";
+$user["mode"]="gluxon.com";
+$user["unused"]="unused";
+$user["realname"]="sherly";
+$user["password"]="password";
+
+// Default join channel
+$channel["name"]="##phpwolf";
+
+// Admins array
+$admins = array('*@freenode/staff/*',
+                '~gluxon@unaffiliated/gluxon',
+                '~Snuupy@unaffiliated/snuupy',
+                '~ceradon@wikimedia/Ceradon',
+                '~mithadon@unaffiliated/mithadon',
+                'ishanyx@junethack/teamsplat/ishanyx');
+
+// Language
+$lang='en_US';
+?>
